@@ -195,13 +195,14 @@ function calcDistance(lat1, lng1, lat2, lng2) {
 
 function datedAvailability(hotel, checkIn, checkOut, searchTick) {
   const seed = `${hotel.placeId}|${checkIn}|${checkOut}|${searchTick}`;
-  let hash = 0;
+  let hash = 2166136261; // FNV-1a offset basis
   for (let i = 0; i < seed.length; i++) {
-    hash = ((hash << 5) - hash + seed.charCodeAt(i)) | 0;
+    hash ^= seed.charCodeAt(i);
+    hash = Math.imul(hash, 16777619) >>> 0; // FNV prime, unsigned
   }
-  const v = Math.abs(hash) % 100;
-  let threshold = 30;
-  if (hotel.google >= 4.6 && hotel.reviewCount > 200) threshold = 45;
+  const v = hash % 100;
+  let threshold = 40; // ~40% fully booked
+  if (hotel.google >= 4.6 && hotel.reviewCount > 200) threshold = 55; // popular = more often booked
   return v >= threshold;
 }
 
@@ -434,20 +435,68 @@ function InquiryModal({ hotel, booking, onClose }) {
   const [lang, setLang] = useState('zh-TW');
   const [recipientEmail, setRecipientEmail] = useState('');
   const [details, setDetails] = useState(null);
+  const [detailsTried, setDetailsTried] = useState(false);
   const [copied, setCopied] = useState(false);
+  const [emailSearching, setEmailSearching] = useState(false);
+  const [suggestedEmails, setSuggestedEmails] = useState([]);
+  const [emailSource, setEmailSource] = useState(null); // 'website' | 'search' | null
+  const [bookingPageUrl, setBookingPageUrl] = useState(null);
 
   useEffect(() => {
-    if (hotel.placeId && !hotel.phone) {
-      fetch(`${API_BASE}/api/places/details?placeId=${hotel.placeId}&language=en`)
-        .then(r => r.json())
-        .then(d => { if (d.result) setDetails(d.result); })
-        .catch(() => {});
+    if (!hotel.placeId) { setDetailsTried(true); return; }
+    fetch(`${API_BASE}/api/places/details?placeId=${hotel.placeId}&language=en`)
+      .then(r => r.json())
+      .then(d => { if (d.result) setDetails(d.result); })
+      .catch(() => {})
+      .finally(() => setDetailsTried(true));
+  }, [hotel.placeId]);
+
+  // Find the hotel's email once the details fetch has settled. Primary path is
+  // scraping the official website (free); if there's no website or no email is
+  // found, fall back to a Claude web search using the hotel name + address.
+  useEffect(() => {
+    if (!detailsTried) return;
+    let cancelled = false;
+
+    async function lookup() {
+      setEmailSearching(true);
+      try {
+        // 1) Scrape the official website, if Google Places gave us one
+        const website = details?.website;
+        if (website) {
+          const d = await fetch(`${API_BASE}/api/hotel/website-info?url=${encodeURIComponent(website)}`)
+            .then(r => r.json()).catch(() => ({}));
+          if (cancelled) return;
+          if (d.bookingUrl) setBookingPageUrl(d.bookingUrl);
+          if (d.emails?.length) {
+            setSuggestedEmails(d.emails);
+            setRecipientEmail(prev => prev || d.emails[0]);
+            setEmailSource('website');
+            return;
+          }
+        }
+        // 2) Fallback: ask Claude to web-search for the official email
+        const params = new URLSearchParams({ name: hotel.name, address: hotel.address || '' });
+        const f = await fetch(`${API_BASE}/api/hotel/find-email?${params}`)
+          .then(r => r.json()).catch(() => ({}));
+        if (cancelled) return;
+        if (f.email) {
+          setSuggestedEmails(prev => (prev.length ? prev : [f.email]));
+          setRecipientEmail(prev => prev || f.email);
+          setEmailSource('search');
+        }
+      } finally {
+        if (!cancelled) setEmailSearching(false);
+      }
     }
-  }, [hotel.placeId, hotel.phone]);
+
+    lookup();
+    return () => { cancelled = true; };
+  }, [detailsTried]);
 
   const phone = details?.formatted_phone_number || details?.international_phone_number || hotel.phone;
   const website = details?.website;
-  const mapsUrl = `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(hotel.name)}&query_place_id=${hotel.placeId}`;
+  const mapsUrl = `https://www.google.com/maps/place/?q=place_id:${hotel.placeId}`;
 
   const { subject, body } = buildEmailContent(hotel, lang, booking);
 
@@ -483,25 +532,58 @@ function InquiryModal({ hotel, booking, onClose }) {
             )}
             {website && (
               <a href={website} target="_blank" rel="noopener noreferrer" className="flex items-center gap-1 text-blue-600 hover:underline">
-                <Globe size={13} />Website
+                <Globe size={13} />官方網站
+              </a>
+            )}
+            {(bookingPageUrl || website) && (
+              <a href={bookingPageUrl || website} target="_blank" rel="noopener noreferrer"
+                className="flex items-center gap-1.5 px-2.5 py-0.5 rounded-full bg-emerald-600 text-white text-xs font-medium hover:bg-emerald-700">
+                <ExternalLink size={11} />官網訂房
               </a>
             )}
             <a href={mapsUrl} target="_blank" rel="noopener noreferrer" className="flex items-center gap-1 text-stone-500 hover:underline">
-              <MapPin size={13} />Find email on Google Maps
+              <MapPin size={13} />Google Maps
             </a>
           </div>
         </div>
 
         <div className="p-6 space-y-4">
           <div>
-            <label className="block text-xs font-medium text-stone-500 mb-1">Recipient Email</label>
+            <div className="flex items-center justify-between mb-1">
+              <label className="text-xs font-medium text-stone-500">收件者 Email</label>
+              {emailSearching && (
+                <span className="text-xs text-stone-400 flex items-center gap-1">
+                  <span className="w-3 h-3 border-2 border-stone-300 border-t-emerald-500 rounded-full animate-spin inline-block" />
+                  搜尋官網 email…
+                </span>
+              )}
+              {!emailSearching && emailSource === 'website' && (
+                <span className="text-xs text-emerald-600">✓ 從官網自動偵測</span>
+              )}
+              {!emailSearching && emailSource === 'search' && (
+                <span className="text-xs text-emerald-600">✓ 透過網路搜尋找到</span>
+              )}
+              {!emailSearching && detailsTried && !emailSource && !recipientEmail && (
+                <span className="text-xs text-amber-600">查無 email，請手動輸入</span>
+              )}
+            </div>
             <input
               type="email"
               value={recipientEmail}
               onChange={e => setRecipientEmail(e.target.value)}
-              placeholder="Paste hotel email from Google Maps listing"
+              placeholder="自動搜尋中，或手動貼上飯店 email"
               className="w-full border border-stone-300 rounded-lg px-3 py-2 text-sm text-stone-800 focus:outline-none focus:ring-2 focus:ring-emerald-400"
             />
+            {suggestedEmails.length > 1 && (
+              <div className="flex flex-wrap gap-1.5 mt-1.5">
+                {suggestedEmails.map(e => (
+                  <button key={e} type="button" onClick={() => setRecipientEmail(e)}
+                    className={`text-xs px-2 py-0.5 rounded-full border transition-colors ${recipientEmail === e ? 'bg-emerald-600 text-white border-emerald-600' : 'border-stone-300 text-stone-600 hover:bg-stone-50'}`}>
+                    {e}
+                  </button>
+                ))}
+              </div>
+            )}
           </div>
 
           <div>
@@ -563,15 +645,88 @@ function InquiryModal({ hotel, booking, onClose }) {
   );
 }
 
+// ─── Link Preview ────────────────────────────────────────────────────────────
+const SITE_META = {
+  maps: {
+    label: 'Google Maps',
+    icon: 'https://www.google.com/favicon.ico',
+    color: '#4285F4',
+    desc: 'View location on Google Maps',
+  },
+  booking: {
+    label: 'Booking.com',
+    icon: 'https://www.booking.com/favicon.ico',
+    color: '#003580',
+    desc: 'Check availability & book on Booking.com',
+  },
+  agoda: {
+    label: 'Agoda',
+    icon: 'https://www.agoda.com/favicon.ico',
+    color: '#E11D48',
+    desc: 'Search & compare prices on Agoda',
+  },
+};
+
+function LinkPreview({ type, href, hotelName, price, currency, children }) {
+  const [show, setShow] = useState(false);
+  const [pos, setPos] = useState({ x: 0, y: 0 });
+  const meta = SITE_META[type];
+
+  function handleMouseEnter(e) {
+    setPos({ x: e.clientX, y: e.clientY });
+    setShow(true);
+  }
+  function handleMouseMove(e) {
+    setPos({ x: e.clientX, y: e.clientY });
+  }
+
+  return (
+    <span className="relative inline-block"
+      onMouseEnter={handleMouseEnter}
+      onMouseMove={handleMouseMove}
+      onMouseLeave={() => setShow(false)}
+    >
+      <a href={href} target="_blank" rel="noopener noreferrer"
+        className="text-xs px-2 py-1 border border-stone-200 rounded-md text-stone-500 hover:bg-stone-50 flex items-center gap-1">
+        {children}
+      </a>
+      {show && (
+        <div
+          className="fixed z-50 pointer-events-none"
+          style={{ left: pos.x + 14, top: pos.y - 10 }}
+        >
+          <div className="bg-white rounded-xl shadow-2xl border border-stone-200 p-3 w-56 text-left">
+            <div className="flex items-center gap-2 mb-2">
+              <img src={meta.icon} alt="" className="w-4 h-4 rounded" onError={e => e.target.style.display='none'} />
+              <span className="font-semibold text-xs" style={{ color: meta.color }}>{meta.label}</span>
+            </div>
+            <p className="text-stone-800 text-xs font-medium leading-tight mb-1 line-clamp-2">{hotelName}</p>
+            {price && (
+              <p className="text-emerald-700 text-xs font-bold mb-1">NT${price.toLocaleString()}/晚</p>
+            )}
+            <p className="text-stone-400 text-xs">{meta.desc}</p>
+          </div>
+        </div>
+      )}
+    </span>
+  );
+}
+
 // ─── Hotel Card ───────────────────────────────────────────────────────────────
-function HotelCard({ hotel, distanceM, onEmail }) {
+function HotelCard({ hotel, distanceM, onEmail, checkIn, checkOut, adults }) {
   const dist = distanceM < 1000
     ? `${Math.round(distanceM)} m`
     : `${(distanceM / 1000).toFixed(1)} km`;
 
-  const mapsUrl = `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(hotel.name)}&query_place_id=${hotel.placeId}`;
-  const bookingUrl = `https://www.booking.com/searchresults.html?ss=${encodeURIComponent(hotel.name)}`;
-  const agodaUrl = `https://www.agoda.com/search?q=${encodeURIComponent(hotel.name)}`;
+  // place_id is the most reliable Maps link — works regardless of hotel name language
+  const mapsUrl = hotel.placeId
+    ? `https://www.google.com/maps/place/?q=place_id:${hotel.placeId}`
+    : `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(hotel.name)}`;
+
+  const linkName = hotel.bookingHotelName || hotel.name;
+  const bookingUrl = hotel.bookingDirectUrl
+    || `https://www.booking.com/searchresults.html?ss=${encodeURIComponent(linkName)}&dest_type=property&checkin=${checkIn}&checkout=${checkOut}&group_adults=${adults}&no_rooms=1&selected_currency=TWD`;
+  const agodaUrl = `https://www.agoda.com/search?q=${encodeURIComponent(linkName)}&checkIn=${checkIn}&checkOut=${checkOut}&adults=${adults}&rooms=1`;
 
   return (
     <div className="bg-white rounded-xl border border-stone-200 p-4 flex gap-4 hover:shadow-md transition-shadow">
@@ -587,10 +742,32 @@ function HotelCard({ hotel, distanceM, onEmail }) {
             {hotel.nameLocal && hotel.nameLocal !== hotel.name && (
               <p className="text-stone-400 text-xs">{hotel.nameLocal}</p>
             )}
+            {hotel.bookingHotelName && hotel.bookingHotelName !== hotel.name && (
+              <p className="text-stone-400 text-xs">Booking: {hotel.bookingHotelName}</p>
+            )}
           </div>
-          <span className={`flex-shrink-0 text-xs px-2 py-0.5 rounded-full font-medium ${hotel.available ? 'bg-emerald-50 text-emerald-700' : 'bg-stone-100 text-stone-400'}`}>
-            {hotel.available ? 'Available' : 'Fully booked'}
-          </span>
+          <div className="flex items-center gap-2 flex-shrink-0">
+            {hotel.pricePerNight && (
+              <span className="text-xs font-bold text-emerald-700">
+                NT${hotel.pricePerNight.toLocaleString()}<span className="font-normal text-stone-400">/晚</span>
+              </span>
+            )}
+            {hotel.isRealData ? (
+              hotel.available ? (
+                <span className="text-xs px-2 py-0.5 rounded-full font-medium bg-emerald-50 text-emerald-700 whitespace-nowrap">Available ✓</span>
+              ) : (
+                <a href={bookingUrl} target="_blank" rel="noopener noreferrer"
+                  className="text-xs px-2 py-0.5 rounded-full font-medium bg-stone-100 text-stone-500 hover:bg-stone-200 whitespace-nowrap">
+                  Check Availability
+                </a>
+              )
+            ) : (
+              <a href={bookingUrl} target="_blank" rel="noopener noreferrer"
+                className="text-xs px-2 py-0.5 rounded-full font-medium bg-blue-50 text-blue-700 hover:bg-blue-100 whitespace-nowrap">
+                Check Availability
+              </a>
+            )}
+          </div>
         </div>
 
         {hotel.address && (
@@ -613,15 +790,15 @@ function HotelCard({ hotel, distanceM, onEmail }) {
         </div>
 
         <div className="flex items-center gap-2 mt-2.5 flex-wrap">
-          <a href={mapsUrl} target="_blank" rel="noopener noreferrer" className="text-xs px-2 py-1 border border-stone-200 rounded-md text-stone-500 hover:bg-stone-50 flex items-center gap-1">
+          <LinkPreview type="maps" href={mapsUrl} hotelName={hotel.name} price={hotel.pricePerNight} currency={hotel.currency}>
             <MapPin size={11} />Maps
-          </a>
-          <a href={bookingUrl} target="_blank" rel="noopener noreferrer" className="text-xs px-2 py-1 border border-stone-200 rounded-md text-stone-500 hover:bg-stone-50 flex items-center gap-1">
+          </LinkPreview>
+          <LinkPreview type="booking" href={bookingUrl} hotelName={hotel.name} price={hotel.pricePerNight} currency={hotel.currency}>
             <Hotel size={11} />Booking.com
-          </a>
-          <a href={agodaUrl} target="_blank" rel="noopener noreferrer" className="text-xs px-2 py-1 border border-stone-200 rounded-md text-stone-500 hover:bg-stone-50 flex items-center gap-1">
+          </LinkPreview>
+          <LinkPreview type="agoda" href={agodaUrl} hotelName={hotel.name} price={hotel.pricePerNight} currency={hotel.currency}>
             <Globe size={11} />Agoda
-          </a>
+          </LinkPreview>
           {hotel.phone && (
             <a href={`tel:${hotel.phone}`} className="text-xs px-2 py-1 border border-stone-200 rounded-md text-stone-500 hover:bg-stone-50 flex items-center gap-1">
               <Phone size={11} />Call
@@ -629,14 +806,182 @@ function HotelCard({ hotel, distanceM, onEmail }) {
           )}
           <button
             onClick={onEmail}
-            className={`ml-auto text-xs px-3 py-1 rounded-md font-medium flex items-center gap-1 ${hotel.available ? 'bg-emerald-600 text-white hover:bg-emerald-700' : 'bg-stone-700 text-white hover:bg-stone-600'}`}
+            className="ml-auto text-xs px-3 py-1 rounded-md font-medium flex items-center gap-1 bg-stone-800 text-white hover:bg-stone-600"
           >
-            <Mail size={11} />{hotel.available ? 'Email' : 'Inquire via Email'}
+            <Mail size={11} />Email
           </button>
         </div>
       </div>
     </div>
   );
+}
+
+// ─── Name normalization for fuzzy matching ────────────────────────────────────
+function normName(s) {
+  return (s || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+}
+function wordsOf(s) {
+  return (s || '').toLowerCase().replace(/[^a-z0-9\s]/g, '').split(/\s+/).filter(Boolean);
+}
+function nameScore(a, b) {
+  const na = normName(a), nb = normName(b);
+  if (na === nb) return 1;
+  if (na.includes(nb) || nb.includes(na)) return 0.9;
+  const wa = new Set(wordsOf(a)), wb = wordsOf(b);
+  const shared = wb.filter(w => wa.has(w)).length;
+  const union = new Set([...wa, ...wb]).size;
+  return shared / union; // Jaccard
+}
+
+// ─── Hybrid Search (Google Places ALL hotels + Booking.com availability) ──────
+async function bookingLiveSearch(landmark, checkin, checkout, adults, children, rooms, radiusKm) {
+  // Step 1: resolve landmark to exact coords via Google Places
+  let anchorCoords = null;
+  let englishName = landmark;
+  try {
+    const placesRes = await fetch(`${API_BASE}/api/places/search?query=${encodeURIComponent(landmark)}&language=en`);
+    if (placesRes.ok) {
+      const placesData = await placesRes.json();
+      const place = placesData.results?.[0];
+      if (place) {
+        anchorCoords = place.geometry?.location;
+        englishName = place.name;
+      }
+    }
+  } catch { /* ignore */ }
+
+  if (!anchorCoords) throw new Error('Could not resolve landmark location');
+
+  const radiusM = radiusKm * 1000;
+
+  // Step 2: Google Places nearbysearch — ALL hotels regardless of availability
+  const delay = ms => new Promise(r => setTimeout(r, ms));
+  const seen = new Set();
+  const allHotels = [];
+
+  for (const keyword of HOTEL_KEYWORDS) {
+    let pageToken = '';
+    for (let page = 0; page < 3; page++) {
+      const params = new URLSearchParams({
+        lat: anchorCoords.lat, lng: anchorCoords.lng,
+        radius: radiusM, type: 'lodging', keyword, language: 'zh-TW',
+        ...(pageToken ? { pageToken } : {}),
+      });
+      const r = await fetch(`${API_BASE}/api/places/nearby?${params}`);
+      if (!r.ok) break;
+      const data = await r.json();
+      (data.results || []).forEach(h => {
+        if (!seen.has(h.place_id)) {
+          seen.add(h.place_id);
+          allHotels.push(h);
+        }
+      });
+      if (data.next_page_token) { pageToken = data.next_page_token; await delay(2100); }
+      else break;
+    }
+  }
+
+  // Step 3: Booking.com — available hotels with real prices
+  let availableMap = new Map();
+  try {
+    const destRes = await fetch(`${API_BASE}/api/booking/destination?query=${encodeURIComponent(englishName)}`);
+    if (destRes.ok) {
+      const destData = await destRes.json();
+      // Detect quota-exceeded error from RapidAPI
+      if (destData.message && destData.message.toLowerCase().includes('quota')) {
+        throw Object.assign(new Error(destData.message), { code: 'QUOTA_EXCEEDED' });
+      }
+      const dest = destData.data?.[0];
+      if (dest) {
+        const bParams = new URLSearchParams({
+          dest_id: dest.dest_id, search_type: dest.search_type,
+          checkin_date: checkin, checkout_date: checkout,
+          adults_number: adults, children_number: children,
+          room_number: rooms, currency_code: 'TWD',
+        });
+        const bRes = await fetch(`${API_BASE}/api/booking/search?${bParams}`);
+        if (bRes.ok) {
+          const bData = await bRes.json();
+          (bData.data?.hotels || []).forEach(h => {
+            const price = h.property.priceBreakdown?.grossPrice;
+            const name = h.property.name || '';
+            // dest_type=property targets a specific accommodation, not a city/region
+            const directUrl = `https://www.booking.com/searchresults.html?ss=${encodeURIComponent(name)}&dest_type=property&checkin=${checkin}&checkout=${checkout}&group_adults=${adults}&no_rooms=1&selected_currency=TWD`;
+            availableMap.set(name, {
+              pricePerNight: price ? Math.round(price.value) : null,
+              currency: price?.currency || 'TWD',
+              lat: h.property.latitude ?? null,
+              lng: h.property.longitude ?? null,
+              bookingHotelName: h.property.name,
+              bookingDirectUrl: directUrl,
+            });
+          });
+        }
+      }
+    }
+  } catch { /* Booking.com optional — still show all Google results */ }
+
+  const bookingEntries = Array.from(availableMap.entries()); // [bName, info]
+  console.log('[hybrid] Booking.com available hotels:', bookingEntries.map(([n, i]) => `${n} (${i.lat},${i.lng})`));
+
+  // Haversine distance in metres
+  function haversineM(lat1, lng1, lat2, lng2) {
+    const R = 6371000, toRad = d => d * Math.PI / 180;
+    const dLat = toRad(lat2 - lat1), dLng = toRad(lng2 - lng1);
+    const a = Math.sin(dLat/2)**2 + Math.cos(toRad(lat1))*Math.cos(toRad(lat2))*Math.sin(dLng/2)**2;
+    return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
+  }
+
+  // Step 4: merge — coordinates first (≤300 m), then name fallback (score ≥ 0.7)
+  const merged = allHotels.map(h => {
+    const hLat = h.geometry.location.lat, hLng = h.geometry.location.lng;
+    let bookingInfo = null;
+    let matchLabel = '';
+
+    // 4a: coordinate match
+    let bestDist = Infinity;
+    for (const [bName, bInfo] of bookingEntries) {
+      if (bInfo.lat != null && bInfo.lng != null) {
+        const d = haversineM(hLat, hLng, bInfo.lat, bInfo.lng);
+        if (d < bestDist && d <= 100) { bestDist = d; bookingInfo = bInfo; matchLabel = `coord ${Math.round(d)}m`; }
+      }
+    }
+
+    // 4b: name fallback (only when no coord data available from Booking.com)
+    if (!bookingInfo) {
+      const hasCoords = bookingEntries.some(([, i]) => i.lat != null);
+      if (!hasCoords) {
+        let bestScore = 0;
+        for (const [bName, bInfo] of bookingEntries) {
+          const score = nameScore(h.name, bName);
+          if (score > bestScore && score >= 0.7) { bestScore = score; bookingInfo = bInfo; matchLabel = `name ${bestScore.toFixed(2)}`; }
+        }
+      }
+    }
+
+    if (bookingInfo) console.log(`[hybrid] matched "${h.name}" via ${matchLabel}`);
+    return {
+      name: h.name,
+      nameLocal: h.name,
+      lat: h.geometry.location.lat,
+      lng: h.geometry.location.lng,
+      google: h.rating || 0,
+      reviewCount: h.user_ratings_total || 0,
+      phone: null,
+      placeId: h.place_id,
+      roomTypes: ['Standard Room', 'Deluxe Room', 'Family Room'],
+      available: !!bookingInfo,
+      image: '🏨',
+      address: h.vicinity || '',
+      pricePerNight: bookingInfo?.pricePerNight || null,
+      currency: bookingInfo?.currency || 'TWD',
+      bookingDirectUrl: bookingInfo?.bookingDirectUrl || null,
+      bookingHotelName: bookingInfo?.bookingHotelName || null,
+      isRealData: true,
+    };
+  });
+
+  return { hotels: merged, anchor: anchorCoords };
 }
 
 // ─── Main App ─────────────────────────────────────────────────────────────────
@@ -647,6 +992,8 @@ export default function App() {
 
   // Mode
   const [apiMode, setApiMode] = useState('demo');
+  const [hasRapidApiKey, setHasRapidApiKey] = useState(false);
+  const [rapidApiQuotaExceeded, setRapidApiQuotaExceeded] = useState(false);
 
   // Form state (live)
   const [landmark, setLandmark] = useState('');
@@ -668,8 +1015,9 @@ export default function App() {
   const [error, setError] = useState('');
   const [unknownLandmark, setUnknownLandmark] = useState(false);
 
-  // Sort / display
+  // Sort / display / filter
   const [sortBy, setSortBy] = useState('smart');
+  const [showAvailableOnly, setShowAvailableOnly] = useState(false);
   const [displayCount, setDisplayCount] = useState(10);
   const [loadingMore, setLoadingMore] = useState(false);
 
@@ -683,7 +1031,10 @@ export default function App() {
   useEffect(() => {
     fetch(`${API_BASE}/api/health`)
       .then(r => r.json())
-      .then(d => setApiMode(d.hasKey ? 'live' : 'no-key'))
+      .then(d => {
+        setApiMode(d.hasKey ? 'live' : 'no-key');
+        setHasRapidApiKey(!!d.hasRapidApiKey);
+      })
       .catch(() => setApiMode('demo'));
   }, []);
 
@@ -697,7 +1048,7 @@ export default function App() {
   // ── Infinite scroll ─────────────────────────────────────────────────────────
   useEffect(() => {
     setDisplayCount(10);
-  }, [committedQuery, sortBy]);
+  }, [committedQuery, sortBy, showAvailableOnly]);
 
   useEffect(() => {
     if (!sentinelRef.current) return;
@@ -746,13 +1097,27 @@ export default function App() {
     setHotels([]);
 
     try {
-      if (apiMode === 'live') {
+      if (hasRapidApiKey && !rapidApiQuotaExceeded) {
+        try {
+          const { hotels: bookingHotels, anchor: bookingAnchor } = await bookingLiveSearch(
+            landmark.trim(), checkIn, checkOut, adults, children, Math.max(1, totalRooms), radiusKm
+          );
+          setHotels(bookingHotels);
+          setAnchor(bookingAnchor);
+        } catch (bookingErr) {
+          if (bookingErr.code === 'QUOTA_EXCEEDED') {
+            setRapidApiQuotaExceeded(true);
+            // fall through to Google Places below
+            const { hotels: liveHotels, anchor: liveAnchor } = await liveSearchHotels(landmark.trim(), radiusKm);
+            setHotels(liveHotels);
+            setAnchor(liveAnchor);
+          } else {
+            throw bookingErr;
+          }
+        }
+      } else if (apiMode === 'live') {
         const { hotels: liveHotels, anchor: liveAnchor } = await liveSearchHotels(landmark.trim(), radiusKm);
-        const withAvail = liveHotels.map(h => ({
-          ...h,
-          available: datedAvailability(h, checkIn, checkOut, tick),
-        }));
-        setHotels(withAvail);
+        setHotels(liveHotels);
         setAnchor(liveAnchor);
       } else {
         const dataset = resolveDataset(landmark.trim());
@@ -761,11 +1126,7 @@ export default function App() {
           setLoading(false);
           return;
         }
-        const withAvail = dataset.hotels.map(h => ({
-          ...h,
-          available: datedAvailability(h, checkIn, checkOut, tick),
-        }));
-        setHotels(withAvail);
+        setHotels(dataset.hotels);
         setAnchor(dataset.anchor);
       }
     } catch (err) {
@@ -794,18 +1155,18 @@ export default function App() {
     }
 
     const sorted = [...withDist].sort((a, b) => {
-      if (a.available !== b.available) return a.available ? -1 : 1;
       const sd = score(b) - score(a);
       if (Math.abs(sd) > 0.0001) return sd;
       return a.distanceM - b.distanceM;
     });
 
     const thresholdM = (committedQuery?.radiusKm ?? radiusKm) * 1000;
+    const filtered = showAvailableOnly ? sorted.filter(h => h.available) : sorted;
     return {
-      within: sorted.filter(h => h.distanceM <= thresholdM),
-      beyond: sorted.filter(h => h.distanceM > thresholdM),
+      within: filtered.filter(h => h.distanceM <= thresholdM),
+      beyond: filtered.filter(h => h.distanceM > thresholdM),
     };
-  }, [hotels, anchor, sortBy, committedQuery]);
+  }, [hotels, anchor, sortBy, committedQuery, showAvailableOnly]);
 
   const allSorted = [...processedHotels.within, ...processedHotels.beyond];
   const displayed = allSorted.slice(0, displayCount);
@@ -822,11 +1183,15 @@ export default function App() {
   };
 
   // ── Banner ──────────────────────────────────────────────────────────────────
-  const bannerConfig = {
-    live: { bg: 'bg-emerald-50 border-emerald-200 text-emerald-800', text: 'Live mode — Google Places API connected' },
-    'no-key': { bg: 'bg-amber-50 border-amber-200 text-amber-800', text: 'No API key configured — showing demo data. Add GOOGLE_PLACES_API_KEY to backend/.env to enable live search.' },
-    demo: { bg: 'bg-stone-100 border-stone-300 text-stone-600', text: 'Demo mode — backend not reachable. Showing embedded demo data.' },
-  }[apiMode];
+  const bannerConfig = rapidApiQuotaExceeded
+    ? { bg: 'bg-red-50 border-red-200 text-red-800', text: 'RapidAPI 月配額已用完 — 已切換為 Google Places 模式，Booking.com 即時房價暫停。請至 rapidapi.com 升級方案。' }
+    : hasRapidApiKey
+    ? { bg: 'bg-emerald-50 border-emerald-200 text-emerald-800', text: 'Live mode — Booking.com 即時房價與空房 ✓' }
+    : {
+        live: { bg: 'bg-emerald-50 border-emerald-200 text-emerald-800', text: 'Live mode — Google Places API connected' },
+        'no-key': { bg: 'bg-amber-50 border-amber-200 text-amber-800', text: 'No API key configured — showing demo data. Add GOOGLE_PLACES_API_KEY or RAPIDAPI_KEY to backend/.env to enable live search.' },
+        demo: { bg: 'bg-stone-100 border-stone-300 text-stone-600', text: 'Demo mode — backend not reachable. Showing embedded demo data.' },
+      }[apiMode];
 
   return (
     <div className="min-h-screen relative" style={{ background: '#fafaf7', fontFamily: 'Inter, sans-serif', color: '#1c1917' }}>
@@ -993,8 +1358,15 @@ export default function App() {
         {hotels.length > 0 && committedQuery && (
           <>
             {/* Sort controls */}
-            <div className="flex items-center justify-between mb-3">
+            <div className="flex items-center justify-between mb-3 flex-wrap gap-2">
               <p className="text-sm text-stone-500">{allSorted.length} hotel{allSorted.length !== 1 ? 's' : ''} found</p>
+              <div className="flex items-center gap-2 flex-wrap">
+                <button
+                  onClick={() => setShowAvailableOnly(v => !v)}
+                  className={`text-xs px-3 py-1.5 rounded-lg border font-medium transition-colors ${showAvailableOnly ? 'bg-emerald-600 text-white border-emerald-600' : 'border-stone-300 text-stone-600 hover:bg-stone-50'}`}
+                >
+                  {showAvailableOnly ? '✓ Available Only' : 'All Hotels'}
+                </button>
               <div className="flex rounded-lg border border-stone-300 overflow-hidden text-xs">
                 {[['smart','Smart'],['rating','Rating'],['distance','Distance']].map(([val, label]) => (
                   <button
@@ -1005,6 +1377,7 @@ export default function App() {
                     {label}
                   </button>
                 ))}
+              </div>
               </div>
             </div>
 
@@ -1023,6 +1396,9 @@ export default function App() {
                         hotel={h}
                         distanceM={h.distanceM}
                         onEmail={() => setModalHotel(h)}
+                        checkIn={committedQuery.checkIn}
+                        checkOut={committedQuery.checkOut}
+                        adults={committedQuery.adults}
                       />
                     ))}
                 </>
@@ -1044,6 +1420,9 @@ export default function App() {
                         hotel={h}
                         distanceM={h.distanceM}
                         onEmail={() => setModalHotel(h)}
+                        checkIn={committedQuery.checkIn}
+                        checkOut={committedQuery.checkOut}
+                        adults={committedQuery.adults}
                       />
                     ))}
                 </>
