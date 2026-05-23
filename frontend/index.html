@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Hotel Finder</title>
+    <style>
+      @keyframes snowfall {
+        0%   { transform: translateY(-10px) translateX(0px) rotate(0deg); opacity: 0; }
+        10%  { opacity: 0.6; }
+        90%  { opacity: 0.3; }
+        100% { transform: translateY(100vh) translateX(40px) rotate(360deg); opacity: 0; }
+      }
+      .snowflake {
+        position: fixed;
+        top: -10px;
+        color: #c8cfc8;
+        font-size: 1em;
+        animation: snowfall linear infinite;
+        pointer-events: none;
+        z-index: 0;
+        user-select: none;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.jsx"></script>
+  </body>
+</html>
